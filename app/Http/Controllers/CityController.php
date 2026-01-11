@@ -3,43 +3,38 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use App\Services\ZipApiService;
-use Barryvdh\DomPDF\Facade\Pdf as PDF;
-use Maatwebsite\Excel\Facades\Excel;
-use App\Exports\CitiesExport;
-use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Http; // Fontos az API híváshoz
+use Barryvdh\DomPDF\Facade\Pdf;      // Fontos a PDF generáláshoz
+use Illuminate\Support\Facades\Response;
 
 class CityController extends Controller
 {
-    protected $api;
-
-    public function __construct(ZipApiService $api)
-    {
-        $this->api = $api;
-    }
-
-        public function index(Request $request)
+    /**
+     * Fő oldal megjelenítése (Szűrés és Listázás)
+     */
+    public function index(Request $request)
     {
         // 1. Mindig lekérjük a megyéket a legördülőhöz
-        $counties = Http::get('http://127.0.0.1:8000/api/counties')->json();
+        // (Ha az API nem elérhető, üres tömböt ad vissza, hogy ne omoljon össze)
+        try {
+            $counties = Http::get('http://127.0.0.1:8000/api/counties')->json();
+        } catch (\Exception $e) {
+            $counties = [];
+        }
 
         $letters = [];
         $cities = [];
         $selectedCountyId = $request->query('county_id');
         $selectedLetter = $request->query('letter');
 
-        // 2. Ha van kiválasztva megye, lekérjük a betűket
+   
         if ($selectedCountyId) {
             $letters = Http::get("http://127.0.0.1:8000/api/counties/{$selectedCountyId}/letters")->json();
         }
 
-        // 3. Ha van megye ÉS betű is, lekérjük a városokat
+    
         if ($selectedCountyId && $selectedLetter) {
-            // A search végpontunkat használjuk paraméterekkel
-            $cities = Http::get('http://127.0.0.1:8000/api/zipcodes/search', [
-                'county_id' => $selectedCountyId,
-                'letter' => $selectedLetter
-            ])->json();
+            $cities = $this->getFilteredCities($request);
         }
 
         return view('cities.index', [
@@ -51,53 +46,81 @@ class CityController extends Controller
         ]);
     }
 
-    public function exportPdf(Request $request) 
+    /**
+     * CSV Export
+     */
+    public function exportCsv(Request $request)
     {
-         $selectedCountyId = $request->query('county_id');
-         $selectedLetter = $request->query('letter');
-         $cities = [];
- 
-         if ($selectedCountyId) {
-             $allCitiesInCounty = collect($this->api->getCitiesByCounty($selectedCountyId));
-             if ($selectedLetter) {
-                 $cities = $allCitiesInCounty->filter(function($city) use ($selectedLetter) {
-                     return str_starts_with(strtoupper($city['name']), $selectedLetter);
-                 });
-             } else {
-                 $cities = $allCitiesInCounty;
-             }
-         }
+        $cities = $this->getFilteredCities($request);
+        $filename = "varosok-export-" . date('Y-m-d') . ".csv";
 
-         $data = [
-             'title' => 'Város Lista',
-             'cities' => $cities,
-             // Fontos: tegyen egy logo.png-t a public/img mappába!
-             // Ha nincs, kommentelje ki a következő sort:
-             'logo' => public_path('img/logo.png') 
-         ];
-         
-         $pdf = PDF::loadView('exports.cities_pdf', $data);
-         return $pdf->download('varosok.pdf');
+        $headers = [
+            "Content-type"        => "text/csv",
+            "Content-Disposition" => "attachment; filename=$filename",
+            "Pragma"              => "no-cache",
+            "Cache-Control"       => "must-revalidate, post-check=0, pre-check=0",
+            "Expires"             => "0"
+        ];
 
+        $callback = function() use ($cities) {
+            $file = fopen('php://output', 'w');
+            
+            // CSV Fejléc (BOM a helyes karakterkódoláshoz Excelben)
+            fputs($file, "\xEF\xBB\xBF"); 
+            fputcsv($file, ['Település', 'Irányítószám', 'Megye'], ';');
+
+            // Adatok
+            foreach ($cities as $city) {
+                fputcsv($file, [
+                    $city['settlement']['name'],
+                    $city['code'], 
+                    $city['settlement']['county']['name']
+                ], ';');
+            }
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
     }
 
-    public function exportCsv(Request $request) 
+    /**
+     * PDF Export
+     */
+    public function exportPdf(Request $request)
+    {
+        $cities = $this->getFilteredCities($request);
+        
+        // Betöltjük a nézetet és átadjuk az adatokat
+        $pdf = Pdf::loadView('cities.pdf', [
+            'cities' => $cities,
+            'county_id' => $request->query('county_id'),
+            'letter' => $request->query('letter')
+        ]);
+
+        return $pdf->download('varosok-export.pdf');
+    }
+
+    /**
+     * Segédfüggvény: A szűrt városok lekérése az API-tól
+     * (Hogy ne kelljen duplikálni a kódot az index, csv és pdf metódusokban)
+     */
+    private function getFilteredCities(Request $request)
     {
         $selectedCountyId = $request->query('county_id');
         $selectedLetter = $request->query('letter');
-        $cities = [];
 
-        if ($selectedCountyId) {
-            $allCitiesInCounty = collect($this->api->getCitiesByCounty($selectedCountyId));
-            if ($selectedLetter) {
-                $cities = $allCitiesInCounty->filter(function($city) use ($selectedLetter) {
-                    return str_starts_with(strtoupper($city['name']), $selectedLetter);
-                });
-            } else {
-                $cities = $allCitiesInCounty;
+        if ($selectedCountyId && $selectedLetter) {
+            try {
+                $response = Http::get('http://127.0.0.1:8000/api/zipcodes/search', [
+                    'county_id' => $selectedCountyId,
+                    'letter' => $selectedLetter
+                ]);
+                return $response->json();
+            } catch (\Exception $e) {
+                return [];
             }
         }
-        
-        return Excel::download(new CitiesExport($cities), 'varosok.csv');
+
+        return [];
     }
 }
